@@ -159,10 +159,10 @@ func NewPortLock(port int) *PortLock {
 
 // Lock locks on port
 func (p *PortLock) Lock() {
-	var err error
 	t := 1 * time.Second
 	for {
-		if p.ln, err = net.Listen("tcp", p.hostport); err == nil {
+		if l, err := net.Listen("tcp", p.hostport); err == nil {
+			p.ln = l	// thanks to zhangpy
 			return
 		}
 		//log.Printf("spinning lock on %s (%s)", p.hostport, err)
