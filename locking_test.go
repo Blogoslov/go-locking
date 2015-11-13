@@ -48,6 +48,9 @@ type locker interface {
 	Unlock() error
 }
 
+// test the lock.
+//
+// FIXME(tgulacsi): to test IPC locks, a separate process should be run.
 func testLock(lock locker) error {
 	tryLock, isTryLocker := lock.(interface {
 		TryLock() (bool, error)
