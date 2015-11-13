@@ -7,10 +7,12 @@ package locking
 
 import (
 	"errors"
+	"math/rand"
 	"net"
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -20,25 +22,44 @@ var AlreadyLocked = errors.New("AlreadyLocked")
 
 // FLock is a file-based lock
 type FLock struct {
-	fh *os.File
+	path string
+	fh   *os.File
+	sync.Mutex
 }
 
 // NewFLock creates new Flock-based lock (unlocked first)
-func NewFLock(path string) (FLock, error) {
+func NewFLock(path string) (*FLock, error) {
 	fh, err := os.Open(path)
 	if err != nil {
-		return FLock{}, err
+		return nil, err
 	}
-	return FLock{fh: fh}, nil
+	return &FLock{path: path, fh: fh}, nil
 }
 
 // Lock acquires the lock, blocking
-func (lock FLock) Lock() error {
-	return syscall.Flock(int(lock.fh.Fd()), syscall.LOCK_EX)
+func (lock *FLock) Lock() error {
+	lock.Mutex.Lock()
+	defer lock.Mutex.Unlock()
+	if lock.fh == nil {
+		var err error
+		if lock.fh, err = os.Open(lock.path); err != nil {
+			return err
+		}
+	}
+	err := syscall.Flock(int(lock.fh.Fd()), syscall.LOCK_EX)
+	return err
 }
 
 // TryLock acquires the lock, non-blocking
 func (lock FLock) TryLock() (bool, error) {
+	lock.Mutex.Lock()
+	defer lock.Mutex.Unlock()
+	if lock.fh == nil {
+		var err error
+		if lock.fh, err = os.Open(lock.path); err != nil {
+			return false, err
+		}
+	}
 	err := syscall.Flock(int(lock.fh.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
 	switch err {
 	case nil:
@@ -50,17 +71,24 @@ func (lock FLock) TryLock() (bool, error) {
 }
 
 // Unlock releases the lock
-func (lock FLock) Unlock() error {
+func (lock *FLock) Unlock() error {
+	lock.Mutex.Lock()
+	defer lock.Mutex.Unlock()
+	if lock.fh == nil {
+		return nil
+	}
+	err := syscall.Flock(int(lock.fh.Fd()), syscall.LOCK_UN)
 	lock.fh.Close()
-	return syscall.Flock(int(lock.fh.Fd()), syscall.LOCK_UN)
+	lock.fh = nil
+	return err
 }
 
 // FLocks is an array of FLocks, Unlockable at once
-type FLocks []FLock
+type FLocks []*FLock
 
 // FLockDirs returns FLocks for each directory
 func FLockDirs(dirs ...string) (FLocks, error) {
-	locks := make([]FLock, 0, len(dirs))
+	locks := make([]*FLock, 0, len(dirs))
 	allright := false
 	defer func() {
 		if !allright {
@@ -72,7 +100,7 @@ func FLockDirs(dirs ...string) (FLocks, error) {
 	var (
 		err  error
 		ok   bool
-		lock FLock
+		lock *FLock
 	)
 	for _, path := range dirs {
 		if lock, err = NewFLock(path); err != nil {
@@ -121,6 +149,7 @@ func (lock DirLock) Lock() error {
 		ok  bool
 		err error
 	)
+	eb := &expBackoff{time.Second}
 	for {
 		if ok, err = lock.TryLock(); ok && err == nil {
 			return nil
@@ -128,7 +157,7 @@ func (lock DirLock) Lock() error {
 		if err != nil {
 			return err
 		}
-		time.Sleep(1)
+		eb.Sleep()
 	}
 }
 
@@ -158,22 +187,42 @@ func NewPortLock(port int) *PortLock {
 }
 
 // Lock locks on port
-func (p *PortLock) Lock() {
-	t := 1 * time.Second
+func (p *PortLock) Lock() error {
+	eb := &expBackoff{time.Second}
 	for {
-		if l, err := net.Listen("tcp", p.hostport); err == nil {
-			p.ln = l	// thanks to zhangpy
-			return
+		if ok, err := p.TryLock(); ok {
+			return err
 		}
-		//log.Printf("spinning lock on %s (%s)", p.hostport, err)
-		time.Sleep(t)
-		t = time.Duration(float32(t) * 1.2)
+		eb.Sleep()
 	}
+	return nil
+}
+
+// TryLock acquires the lock, non-blocking
+func (p *PortLock) TryLock() (bool, error) {
+	if l, err := net.Listen("tcp", p.hostport); err == nil {
+		p.ln = l // thanks to zhangpy
+		return true, nil
+	}
+	return false, nil
 }
 
 // Unlock unlocks the port lock
-func (p *PortLock) Unlock() {
-	if p.ln != nil {
-		p.ln.Close()
+func (p *PortLock) Unlock() error {
+	if p.ln == nil {
+		return nil
 	}
+	err := p.ln.Close()
+	p.ln = nil
+	return err
+}
+
+type expBackoff struct {
+	time.Duration
+}
+
+func (eb *expBackoff) Sleep() {
+	time.Sleep(eb.Duration)
+	// next sleep length will be in [t, 2t)
+	eb.Duration += time.Duration(float32(eb.Duration) * rand.Float32())
 }
